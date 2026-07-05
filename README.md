@@ -2,8 +2,6 @@
 
 **Pick up exactly where you left off.**
 
-You are deep in a problem. A meeting pops up, a message pulls you away, the laptop closes for the night. When you come back, the windows are gone and the thread of thought is gone with them. You spend the next twenty minutes rebuilding a mental state you had perfectly a moment ago.
-
 Quicksave gives your work a save point. Press it before you step away and it freezes everything that matters. Come back later, load the save point, and your workspace rebuilds itself in seconds.
 
 ## The cost this removes
@@ -22,9 +20,7 @@ A knowledge worker loses hours every week to this. Quicksave hands those hours b
 
 Everything stays on your machine as small local files. Nothing is uploaded, no account is required, and your work never touches a server.
 
-## How it feels
 
-A meeting starts in two minutes. You press your hotkey, type "reworking the IPCW weights, third column unit looks wrong," and walk away. An hour later you load that save point. Your tabs return, your terminals land back in the right folders, VS Code reopens your project, and your Claude Code conversation continues where it stopped. The note reminds you of the exact thought you had. You are working again inside ten seconds.
 
 ## Smart restore
 
