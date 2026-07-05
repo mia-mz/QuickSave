@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
-"""Quicksave — 工作存档点
-用法:
-  qs save [-m "一句话意图"] [-p 项目名]   存档(不带 -m 会弹输入框)
-  qs list                                列出所有存档
-  qs load [编号]                          读档(不带编号会弹选择面板)
-  qs ui                                   打开图形面板
-数据存在 ~/Library/Application Support/Quicksave/,不上传任何内容。
+"""Quicksave — game-style save points for your work
+Usage:
+  qs save [-m "title"] [-n "notes"] [-p project]   create a save point
+  qs list                                          list save points
+  qs load [index]                                  restore one
+  qs ui                                            open the web panel
+All data stays local in ~/Library/Application Support/Quicksave (macOS)
+or ~/.quicksave (Linux/Windows). Nothing is uploaded.
+
+Platform support: macOS full; Linux best-effort (no browser capture);
+Windows minimal (VS Code workspaces + AI sessions).
 """
-import json, os, re, subprocess, sys, datetime, time
+import json, os, re, subprocess, sys, datetime, time, shutil, webbrowser
 from urllib.parse import unquote
 
-VAULT = os.path.expanduser('~/Library/Application Support/Quicksave/saves')
-PROJECTS_FILE = os.path.expanduser('~/Library/Application Support/Quicksave/projects.json')
+IS_MAC = sys.platform == 'darwin'
+IS_LIN = sys.platform.startswith('linux')
+IS_WIN = sys.platform == 'win32'
 
-# ---------------- helpers ----------------
+if IS_MAC:
+    DATA_DIR = os.path.expanduser('~/Library/Application Support/Quicksave')
+else:
+    DATA_DIR = os.path.expanduser('~/.quicksave')
+VAULT = os.path.join(DATA_DIR, 'saves')
+PROJECTS_FILE = os.path.join(DATA_DIR, 'projects.json')
+
+# ---------------- platform helpers ----------------
 
 def osa(script, timeout=20):
-    """Run AppleScript, return stdout or None."""
+    """Run AppleScript (macOS only), return stdout or None."""
+    if not IS_MAC:
+        return None
     try:
         r = subprocess.run(['osascript', '-e', script],
                            capture_output=True, text=True, timeout=timeout)
@@ -32,8 +46,13 @@ def esc(s):
     return s.replace('\\', '\\\\').replace('"', '\\"')
 
 def shq(path):
-    """single-quote a path for a shell command embedded in AppleScript"""
     return "'" + path.replace("'", "'\\''") + "'"
+
+def notify(title, body):
+    if IS_MAC:
+        osa(f'display notification "{esc(body[:60])}" with title "{esc(title)}"')
+    elif IS_LIN and shutil.which('notify-send'):
+        subprocess.run(['notify-send', title, body[:60]], timeout=5)
 
 def load_projects():
     try:
@@ -48,12 +67,14 @@ def add_project(name):
     lst = load_projects()
     if name not in lst:
         lst.append(name)
-        os.makedirs(os.path.dirname(PROJECTS_FILE), exist_ok=True)
+        os.makedirs(DATA_DIR, exist_ok=True)
         json.dump({'projects': lst}, open(PROJECTS_FILE, 'w'), ensure_ascii=False)
     return lst
 
 def _proc_table():
-    """pid -> (ppid, command path) for every process."""
+    """pid -> (ppid, command path)."""
+    if IS_WIN:
+        return {}
     try:
         out = subprocess.run(['ps', '-ax', '-o', 'pid=,ppid=,comm='],
                              capture_output=True, text=True, timeout=10).stdout
@@ -77,6 +98,11 @@ def _ancestors(pid, table, limit=20):
     return out
 
 def _cwd_of(pid):
+    if IS_LIN:
+        try:
+            return os.readlink(f'/proc/{pid}/cwd')
+        except Exception:
+            return None
     try:
         l = subprocess.run(['lsof', '-a', '-p', pid, '-d', 'cwd', '-Fn'],
                            capture_output=True, text=True, timeout=10).stdout
@@ -87,9 +113,56 @@ def _cwd_of(pid):
         pass
     return None
 
+def _vscode_storage():
+    if IS_MAC:
+        return os.path.expanduser('~/Library/Application Support/Code/User/globalStorage/storage.json')
+    if IS_WIN:
+        return os.path.join(os.environ.get('APPDATA', ''), 'Code', 'User', 'globalStorage', 'storage.json')
+    return os.path.expanduser('~/.config/Code/User/globalStorage/storage.json')
+
+def _code_cli():
+    c = shutil.which('code')
+    if c:
+        return c
+    if IS_MAC and os.path.exists('/Applications/Visual Studio Code.app'):
+        return '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code'
+    if IS_WIN:
+        p = os.path.expandvars(r'%LOCALAPPDATA%\Programs\Microsoft VS Code\bin\code.cmd')
+        if os.path.exists(p):
+            return p
+    return None
+
+def _spawn_terminal(cwd, cmd=None):
+    """Open a terminal window at cwd, optionally running cmd. Best effort."""
+    if IS_MAC:
+        full = f'cd {shq(cwd)}' + (f' && {cmd}' if cmd else '')
+        osa(f'tell application "Terminal"\nactivate\ndo script "{esc(full)}"\nend tell', timeout=30)
+        return True
+    if IS_LIN:
+        inner = f'cd {shq(cwd)}' + (f' && {cmd}' if cmd else '') + '; exec bash'
+        for t in (['gnome-terminal', '--'], ['konsole', '-e'],
+                  ['xfce4-terminal', '-e'], ['x-terminal-emulator', '-e']):
+            if shutil.which(t[0]):
+                try:
+                    subprocess.Popen(t + ['bash', '-lc', inner])
+                    return True
+                except Exception:
+                    continue
+        return False
+    if IS_WIN:
+        try:
+            inner = f'cd /d "{cwd}"' + (f' && {cmd}' if cmd else '')
+            subprocess.Popen(['cmd', '/c', 'start', 'cmd', '/K', inner])
+            return True
+        except Exception:
+            return False
+    return False
+
 # ---------------- capture ----------------
 
 def capture_front():
+    if not IS_MAC:
+        return None
     out = osa('''tell application "System Events"
   set p to first application process whose frontmost is true
   set nm to name of p
@@ -105,8 +178,8 @@ end tell''')
     return {'app': parts[0], 'window': parts[1] if len(parts) > 1 else ''}
 
 def capture_browser(app):
-    """app: 'Google Chrome' or 'Safari' -> list of windows, each a list of {url,title}."""
-    if not app_running(app):
+    """macOS only: list of windows, each a list of {url,title}."""
+    if not IS_MAC or not app_running(app):
         return []
     if app == 'Google Chrome':
         script = '''tell application "Google Chrome"
@@ -151,6 +224,8 @@ end tell'''
 
 def _agent_pids(table):
     """pids of running claude/codex CLI processes (with a tty)."""
+    if IS_WIN:
+        return {}
     try:
         out = subprocess.run(['ps', '-ax', '-o', 'pid=,tty=,command='],
                              capture_output=True, text=True, timeout=10).stdout
@@ -159,9 +234,11 @@ def _agent_pids(table):
     found = {}
     for line in out.splitlines():
         bits = line.split(None, 2)
-        if len(bits) != 3 or not bits[1].startswith('ttys'):
+        if len(bits) != 3:
             continue
-        pid, _tty, args = bits
+        pid, tty, args = bits
+        if not (tty.startswith('ttys') or tty.startswith('pts')):
+            continue
         for t in args.split()[:2]:
             base = t.rsplit('/', 1)[-1]
             if base in ('claude', 'codex'):
@@ -171,7 +248,9 @@ def _agent_pids(table):
 
 def _shell_cwds():
     """cwds of interactive shells, excluding scratch dirs and shells that are
-    descendants of an AI agent (claude/codex spawn their own workers)."""
+    descendants of an AI agent."""
+    if IS_WIN:
+        return []
     table = _proc_table()
     agents = set(_agent_pids(table))
     try:
@@ -182,45 +261,48 @@ def _shell_cwds():
     pids = []
     for line in out.splitlines():
         bits = line.split(None, 2)
-        if len(bits) != 3 or not bits[1].startswith('ttys'):
+        if len(bits) != 3:
             continue
-        pid, _tty, comm = bits
+        pid, tty, comm = bits
+        if not (tty.startswith('ttys') or tty.startswith('pts')):
+            continue
         base = comm.rsplit('/', 1)[-1].lstrip('-')
         if base not in ('zsh', 'bash', 'fish', 'sh'):
             continue
         if any(p in agents for p, _ in _ancestors(pid, table)):
-            continue                      # an agent's internal shell, not yours
+            continue
         pids.append(pid)
     if not pids:
         return []
-    try:
-        l = subprocess.run(['lsof', '-a', '-p', ','.join(pids), '-d', 'cwd', '-Fn'],
-                           capture_output=True, text=True, timeout=15).stdout
-    except Exception:
-        return []
     cwds, seen = [], set()
-    for ln in l.splitlines():
-        if ln.startswith('n'):
-            c = ln[1:]
-            if not c or c == '/' or c in seen:
-                continue
-            if c.startswith(('/tmp', '/private/tmp', '/private/var')):
-                continue
-            seen.add(c); cwds.append(c)
+    if IS_LIN:
+        raw = [_cwd_of(p) for p in pids]
+    else:
+        raw = []
+        try:
+            l = subprocess.run(['lsof', '-a', '-p', ','.join(pids), '-d', 'cwd', '-Fn'],
+                               capture_output=True, text=True, timeout=15).stdout
+            raw = [ln[1:] for ln in l.splitlines() if ln.startswith('n')]
+        except Exception:
+            pass
+    for c in raw:
+        if not c or c == '/' or c in seen:
+            continue
+        if c.startswith(('/tmp', '/private/tmp', '/private/var')):
+            continue
+        seen.add(c); cwds.append(c)
     return cwds
 
 def capture_terminals():
     cwds = _shell_cwds()
     if not cwds:
         return None
-    app = 'iTerm2' if app_running('iTerm2') else 'Terminal'
+    app = 'iTerm2' if (IS_MAC and app_running('iTerm2')) else 'Terminal'
     return {'app': app, 'cwds': cwds}
 
 def capture_vscode():
-    """VS Code's last-known open workspace folders."""
-    p = os.path.expanduser('~/Library/Application Support/Code/User/globalStorage/storage.json')
     try:
-        st = json.load(open(p))
+        st = json.load(open(_vscode_storage()))
         wins = st.get('windowsState', {}).get('openedWindows', [])
         last = st.get('windowsState', {}).get('lastActiveWindow')
         if last:
@@ -230,6 +312,8 @@ def capture_vscode():
             uri = (w or {}).get('folder', '')
             if uri.startswith('file://'):
                 path = unquote(uri[7:])
+                if IS_WIN and re.match(r'^/[A-Za-z]:', path):
+                    path = path[1:]
                 if path and path not in seen and os.path.exists(path):
                     seen.add(path); out.append(path)
         return out
@@ -237,13 +321,13 @@ def capture_vscode():
         return []
 
 def _host_of(pid, table):
-    """Which app hosts this process: 'vscode' or 'terminal'."""
     for _pid, comm in _ancestors(pid, table):
         name = comm.rsplit('/', 1)[-1]
-        if 'Code Helper' in comm or name in ('Electron', 'Code'):
+        if 'Code Helper' in comm or name in ('Electron', 'Code', 'code'):
             return 'vscode'
         if name in ('Terminal', 'iTerm2', 'iTerm', 'WarpTerminal', 'ghostty',
-                    'kitty', 'alacritty', 'Hyper'):
+                    'kitty', 'alacritty', 'Hyper', 'gnome-terminal-server',
+                    'konsole', 'xterm'):
             return 'terminal'
     return 'terminal'
 
@@ -265,7 +349,6 @@ def capture_agents():
     return found
 
 def _claude_session_for(cwd):
-    """Newest Claude Code session id for a project dir."""
     base = os.path.expanduser('~/.claude/projects/')
     for enc in (cwd.replace('/', '-'), re.sub(r'[/.]', '-', cwd)):
         d = base + enc
@@ -281,12 +364,17 @@ def _claude_session_for(cwd):
 # ---------------- save ----------------
 
 def ask_intent():
-    out = osa('''display dialog "此刻你正要干嘛?一句话。" default answer "" with title "Quicksave 存档" buttons {"取消", "存档"} default button "存档"''', timeout=120)
-    if not out or 'text returned:' not in out:
+    if IS_MAC:
+        out = osa('''display dialog "此刻你正要干嘛?一句话。" default answer "" with title "Quicksave" buttons {"取消", "存档"} default button "存档"''', timeout=120)
+        if not out or 'text returned:' not in out:
+            return None
+        return out.split('text returned:')[-1].strip()
+    try:
+        return input('标题(此刻你正要干嘛): ').strip() or None
+    except (EOFError, KeyboardInterrupt):
         return None
-    return out.split('text returned:')[-1].strip()
 
-def do_save(intent=None, project=''):
+def do_save(intent=None, project='', note=''):
     if intent is None:
         intent = ask_intent()
         if intent is None:
@@ -298,6 +386,7 @@ def do_save(intent=None, project=''):
     state = {
         'ts': ts.isoformat(timespec='seconds'),
         'intent': intent,
+        'note': note or '',
         'project': project or '',
         'front': capture_front(),
         'chrome': capture_browser('Google Chrome'),
@@ -312,9 +401,11 @@ def do_save(intent=None, project=''):
     nterm = len(state['terminals']['cwds']) if state['terminals'] else 0
     nag = len(state['agents'])
     print(f'✅ 存档完成 {slug}' + (f'  [{project}]' if project else ''))
-    print(f'   意图: {intent}')
+    print(f'   {intent}')
     print(f'   浏览器 {ntabs} 标签 · 终端 {nterm} 目录 · VS Code {len(state["vscode"])} 工作区 · AI 会话 {nag}')
-    osa(f'display notification "{esc(intent[:40])}" with title "Quicksave 已存档" subtitle "浏览器 {ntabs} 标签 · AI 会话 {nag}"')
+    if not IS_MAC:
+        print('   (本平台不支持浏览器标签采集)')
+    notify('Quicksave', intent[:40])
     return slug
 
 # ---------------- restore ----------------
@@ -341,17 +432,20 @@ def restore_browser(app, wins):
         skipped += have
         if not urls:
             continue
-        if app == 'Google Chrome':
+        if IS_MAC and app == 'Google Chrome':
             lines = ['set w to make new window',
                      f'set URL of active tab of w to "{esc(urls[0])}"']
             for u in urls[1:]:
                 lines.append(f'tell w to make new tab with properties {{URL:"{esc(u)}"}}')
             osa('tell application "Google Chrome"\nactivate\n' + '\n'.join(lines) + '\nend tell', timeout=60)
-        else:
+        elif IS_MAC and app == 'Safari':
             lines = ['set d to make new document with properties {URL:"%s"}' % esc(urls[0])]
             for u in urls[1:]:
                 lines.append(f'tell front window to set t to make new tab with properties {{URL:"{esc(u)}"}}')
             osa('tell application "Safari"\nactivate\n' + '\n'.join(lines) + '\nend tell', timeout=60)
+        else:
+            for u in urls:
+                webbrowser.open(u)
         opened += len(urls)
     return opened, skipped
 
@@ -364,7 +458,7 @@ def restore_terminals(term, exclude=None):
     cwds, extra = want[:5], max(0, len(want) - 5)
     if not cwds:
         return [], len(term['cwds'])
-    if term['app'] == 'iTerm2':
+    if IS_MAC and term['app'] == 'iTerm2':
         lines = ['set w to create window with default profile',
                  f'tell current session of w to write text "cd {shq(cwds[0])}"']
         for c in cwds[1:]:
@@ -374,8 +468,8 @@ def restore_terminals(term, exclude=None):
             lines.append('end tell')
         osa('tell application "iTerm2"\nactivate\n' + '\n'.join(lines) + '\nend tell', timeout=60)
     else:
-        lines = [f'do script "cd {shq(c)}"' for c in cwds]
-        osa('tell application "Terminal"\nactivate\n' + '\n'.join(lines) + '\nend tell', timeout=60)
+        for c in cwds:
+            _spawn_terminal(c)
     return cwds, len(term['cwds']) - len(cwds) + extra
 
 def restore_vscode(folders):
@@ -383,34 +477,29 @@ def restore_vscode(folders):
     for f in folders[:4]:
         if code:
             subprocess.run([code, f], timeout=15)
-        else:
+        elif IS_MAC:
             subprocess.run(['open', '-a', 'Visual Studio Code', f])
     return len(folders[:4])
-
-def _code_cli():
-    import shutil as _sh
-    return (_sh.which('code') or
-            ('/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code'
-             if os.path.exists('/Applications/Visual Studio Code.app') else None))
 
 def _frontmost():
     return osa('tell application "System Events" to get name of first application process whose frontmost is true')
 
 def _resume_in_vscode(folder, cmd):
-    """Open the workspace, wait until VS Code is truly frontmost, then spawn a
-    fresh integrated terminal (^⇧`) and paste the resume command.
-    Never types unless VS Code owns the keyboard. Returns True on success."""
+    """macOS: open the workspace, wait until VS Code is frontmost, then spawn
+    a fresh integrated terminal (^⇧`) and paste the resume command.
+    Never types unless VS Code owns the keyboard."""
+    if not IS_MAC:
+        return False
     code = _code_cli()
     if code:
         subprocess.run([code, folder], timeout=15)
     else:
         subprocess.run(['open', '-a', 'Visual Studio Code', folder])
-    ok_front = False
-    for _ in range(14):                       # up to ~7s for the window
+    for _ in range(14):
         if _frontmost() == 'Code':
-            ok_front = True; break
+            break
         time.sleep(0.5)
-    if not ok_front:
+    else:
         return False
     old_clip = subprocess.run(['pbpaste'], capture_output=True, text=True).stdout
     subprocess.run(['pbcopy'], input=cmd, text=True)
@@ -431,11 +520,11 @@ return "ok"''', timeout=30)
 
 def restore_agents(agents):
     """Resume AI sessions in the host they were captured in.
-    Returns (claimed_cwds, detail list)."""
+    Returns (claimed_cwds, detail list of (name, how))."""
     if not agents:
         return set(), []
     cur = {(a['tool'], a['cwd']) for a in capture_agents()}
-    used, detail, term_lines = set(), [], []
+    used, detail = set(), []
     for a in agents:
         cwd = a.get('cwd', '')
         name = f"{a['tool']} @ {cwd.rsplit('/', 1)[-1] or cwd}"
@@ -446,17 +535,15 @@ def restore_agents(agents):
         if a['tool'] == 'claude':
             cmd = 'claude --resume ' + a['session'] if a.get('session') else 'claude --continue'
         else:
-            cmd = 'codex resume'          # per-session picker, not blind --last
+            cmd = 'codex resume'
         used.add(cwd)
         if a.get('host') == 'vscode' and _resume_in_vscode(cwd, cmd):
             detail.append((name, 'vscode')); continue
+        ok = _spawn_terminal(cwd, cmd)
         if a.get('host') == 'vscode':
-            detail.append((name, 'terminal-fallback'))
+            detail.append((name, 'terminal-fallback' if ok else 'failed'))
         else:
-            detail.append((name, 'terminal'))
-        term_lines.append(f'do script "{esc(f"cd {shq(cwd)} && {cmd}")}"')
-    if term_lines:
-        osa('tell application "Terminal"\nactivate\n' + '\n'.join(term_lines) + '\nend tell', timeout=60)
+            detail.append((name, 'terminal' if ok else 'failed'))
     return used, detail
 
 # ---------------- list / load ----------------
@@ -490,24 +577,38 @@ def do_list():
     for i, (slug, st) in enumerate(saves, 1):
         print(f'{i:3d}. {label(slug, st)}')
 
-AGENT_WORDS = {'vscode': '已在 VS Code 内置终端接上', 'terminal': '已在 Terminal 接上',
-               'terminal-fallback': '进不去 VS Code(缺辅助功能权限),改在 Terminal 接上',
-               'already': '本来就开着,没动', 'gone': '项目目录已不存在,跳过'}
+AGENT_WORDS_CN = {'vscode': '已在 VS Code 内置终端接上', 'terminal': '已在终端接上',
+                  'terminal-fallback': '进不去 VS Code(缺辅助功能权限),改在终端接上',
+                  'already': '本来就开着,没动', 'gone': '项目目录已不存在,跳过',
+                  'failed': '没能自动打开,请手动恢复'}
+
+def _pick_save(saves):
+    items = [label(s, st) for s, st in saves[:20]]
+    if IS_MAC:
+        lst = ', '.join('"' + esc(x) + '"' for x in items)
+        out = osa(f'choose from list {{{lst}}} with title "Quicksave" with prompt "回到哪个瞬间?" OK button name "读档" cancel button name "算了"', timeout=120)
+        if not out or out == 'false':
+            return None
+        try:
+            return items.index(out) + 1
+        except ValueError:
+            return None
+    for i, x in enumerate(items, 1):
+        print(f'{i:3d}. {x}')
+    try:
+        n = input('读哪个档(编号): ').strip()
+        return int(n) if n.isdigit() and 1 <= int(n) <= len(items) else None
+    except (EOFError, KeyboardInterrupt):
+        return None
 
 def do_load(idx=None, interactive=True):
     saves = all_saves()
     if not saves:
         print('没有存档。'); return None
     if idx is None:
-        items = [label(s, st) for s, st in saves[:20]]
-        lst = ', '.join('"' + esc(x) + '"' for x in items)
-        out = osa(f'choose from list {{{lst}}} with title "Quicksave 读档" with prompt "回到哪个瞬间?" OK button name "读档" cancel button name "算了"', timeout=120)
-        if not out or out == 'false':
+        idx = _pick_save(saves)
+        if idx is None:
             print('已取消。'); return None
-        try:
-            idx = items.index(out) + 1
-        except ValueError:
-            print('没找到该存档。'); return None
     slug, st = saves[idx - 1]
     print(f'读档: {label(slug, st)}')
     ncode = restore_vscode(st.get('vscode', []))
@@ -516,44 +617,45 @@ def do_load(idx=None, interactive=True):
     s_open, s_skip = restore_browser('Safari', st.get('safari', []))
     t_open, t_skip = restore_terminals(st.get('terminals'), exclude=used)
     summary = {
-        'intent': st.get('intent') or '(当时没留话)',
+        'intent': st.get('intent') or '',
+        'note': st.get('note') or '',
         'tabs_opened': c_open + s_open, 'tabs_already': c_skip + s_skip,
         'terms_opened': t_open, 'terms_skipped': t_skip,
         'code': ncode,
-        'agents': [{'name': n, 'how': h, 'text': AGENT_WORDS.get(h, h)} for n, h in agent_detail],
+        'agents': [{'name': n, 'how': h} for n, h in agent_detail],
     }
     print(f"   补开标签 {summary['tabs_opened']}(已开着 {summary['tabs_already']} 个没动)"
           f" · 终端 {len(t_open)} · VS Code {ncode}")
     for a in summary['agents']:
-        print(f"   {a['name']}: {a['text']}")
-    if interactive:
+        print(f"   {a['name']}: {AGENT_WORDS_CN.get(a['how'], a['how'])}")
+    if interactive and summary['intent'] and IS_MAC:
         osa(f'display dialog "{esc(summary["intent"])}" with title "你当时说" buttons {{"好"}} default button "好"', timeout=120)
     print('✅ 恢复完成。')
     return summary
 
 # ---------------- web ui ----------------
 
-UI_HTML = r'''<!doctype html><html lang="zh-CN"><head>
+UI_HTML = r'''<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Quicksave</title>
 <style>
 :root{
   --bg:#14161d; --card:#1b1e2a; --card2:#20242f; --line:rgba(214,222,255,.08);
   --ink:#e8ebf5; --dim:#8b91a8; --gold:#f0b849; --gold-dim:rgba(240,184,73,.14);
-  --mint:#7ed9a5; --red:#ff8d7a;
+  --red:#ff8d7a;
   --mono:ui-monospace,"SF Mono",Menlo,monospace;
-  --serif:"Songti SC","STSong",serif;
+  --serif:Georgia,"Times New Roman",serif;
 }
 *{box-sizing:border-box}
 body{margin:0;background:linear-gradient(180deg,#171a23,#12141b 60%,#0e1015);color:var(--ink);
-  font:15px/1.7 -apple-system,"PingFang SC",sans-serif;min-height:100vh}
+  font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh}
 .wrap{max-width:760px;margin:0 auto;padding:44px 24px 80px}
 header{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px;gap:16px;flex-wrap:wrap}
 .brand .word{font:600 13px var(--mono);letter-spacing:.42em;color:var(--gold);text-transform:uppercase}
-.brand h1{margin:2px 0 0;font-size:26px;font-weight:700;letter-spacing:.04em}
+.brand h1{margin:2px 0 0;font-size:26px;font-weight:700;letter-spacing:.01em}
 .newbtn{
   appearance:none;border:1px solid rgba(240,184,73,.55);background:var(--gold-dim);color:#ffd98f;
-  font:600 14px/1 inherit;padding:12px 22px;border-radius:12px;cursor:pointer;letter-spacing:.05em;
+  font:600 14px/1 inherit;padding:12px 22px;border-radius:12px;cursor:pointer;letter-spacing:.03em;
   transition:background .15s, transform .1s;
 }
 .newbtn:hover{background:rgba(240,184,73,.24)} .newbtn:active{transform:scale(.98)}
@@ -581,10 +683,14 @@ header{display:flex;justify-content:space-between;align-items:center;margin-bott
 }
 .when .rel{color:#c9cfdf}
 .intent{
-  font-family:var(--serif);font-size:19px;line-height:1.55;font-weight:700;margin:7px 0 8px;
+  font-family:var(--serif);font-size:19px;line-height:1.5;font-weight:600;margin:7px 0 3px;
   overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
 }
 .intent.none{color:var(--dim);font-weight:400;font-style:italic}
+.notep{
+  color:var(--dim);font-size:13px;margin:0 0 8px;
+  overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;
+}
 .chips{display:flex;gap:7px;flex-wrap:wrap}
 .chip{font-size:11.5px;color:var(--dim);border:1px solid var(--line);background:var(--card2);
   padding:2.5px 9px;border-radius:999px;white-space:nowrap}
@@ -592,7 +698,7 @@ header{display:flex;justify-content:space-between;align-items:center;margin-bott
 .acts{display:flex;gap:10px;margin-top:11px;align-items:center}
 .load{
   appearance:none;border:0;background:var(--gold);color:#241a05;font:700 13px/1 inherit;
-  padding:9px 20px;border-radius:9px;cursor:pointer;letter-spacing:.06em;transition:filter .15s;
+  padding:9px 20px;border-radius:9px;cursor:pointer;letter-spacing:.04em;transition:filter .15s;
 }
 .load:hover{filter:brightness(1.08)}
 .load:disabled{opacity:.5;cursor:default}
@@ -606,19 +712,21 @@ kbd{font:11px var(--mono);border:1px solid var(--line);border-bottom-width:2px;b
   padding:1px 6px;background:var(--card2);color:var(--dim)}
 .foot{margin-top:36px;text-align:center;color:rgba(139,145,168,.7);font-size:12px}
 .veil{position:fixed;inset:0;background:rgba(8,9,13,.66);backdrop-filter:blur(4px);
-  display:flex;align-items:flex-start;justify-content:center;padding-top:16vh;z-index:20}
-.modal{width:min(92vw,520px);background:var(--card);border:1px solid rgba(240,184,73,.35);
+  display:flex;align-items:flex-start;justify-content:center;padding-top:14vh;z-index:20}
+.modal{width:min(92vw,540px);background:var(--card);border:1px solid rgba(240,184,73,.35);
   border-radius:16px;padding:24px;box-shadow:0 30px 80px rgba(0,0,0,.6)}
 .modal h2{margin:0 0 4px;font-size:17px}
 .modal p{margin:0 0 14px;color:var(--dim);font-size:13px}
-.modal .quote{font-family:var(--serif);font-size:19px;font-weight:700;margin:8px 0 12px}
+.modal .quote{font-family:var(--serif);font-size:19px;font-weight:600;margin:8px 0 6px}
+.modal .notefull{color:var(--dim);font-size:13.5px;white-space:pre-wrap;margin:0 0 12px}
 .modal ul{margin:0 0 6px;padding-left:18px;color:var(--dim);font-size:13.5px}
 .modal ul b{color:var(--ink)}
-.modal input{
-  width:100%;font:16px inherit;color:var(--ink);background:var(--card2);
-  border:1px solid var(--line);border-radius:10px;padding:12px 14px;outline:none;
+.modal input,.modal textarea{
+  width:100%;font:15px/1.6 inherit;color:var(--ink);background:var(--card2);
+  border:1px solid var(--line);border-radius:10px;padding:11px 14px;outline:none;resize:vertical;
 }
-.modal input:focus{border-color:rgba(240,184,73,.5)}
+.modal textarea{margin-top:10px;min-height:76px}
+.modal input:focus,.modal textarea:focus{border-color:rgba(240,184,73,.5)}
 .mrow{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}
 .mrow .ghost{opacity:1}
 .toast{
@@ -633,19 +741,27 @@ kbd{font:11px var(--mono);border:1px solid var(--line);border-bottom-width:2px;b
   <header>
     <div class="brand">
       <div class="word">Quicksave</div>
-      <h1>工作存档点</h1>
+      <h1>Save points</h1>
     </div>
-    <button class="newbtn" id="newBtn">📌 新建存档</button>
+    <button class="newbtn" id="newBtn">New save point</button>
   </header>
   <div class="tabs" id="tabs"></div>
   <div class="slots" id="slots"></div>
-  <div class="foot">↑↓ 选择 · <kbd>回车</kbd> 读档 · 终端里 <span style="font-family:var(--mono)">qs save</span> 随时存</div>
+  <div class="foot">↑/↓ select · <kbd>Enter</kbd> to load · <span style="font-family:var(--mono)">qs save</span> from any terminal</div>
 </div>
 <div class="toast" id="toast"></div>
 <script>
 const TOKEN='__TOKEN__';
 const $=s=>document.querySelector(s);
 const api=(url,opt)=>fetch(url,Object.assign({headers:{'X-QS-Token':TOKEN,'Content-Type':'application/json'}},opt||{}));
+const AGENT_TEXT={
+  vscode:'resumed in the VS Code terminal',
+  terminal:'resumed in a terminal window',
+  'terminal-fallback':'VS Code input unavailable (accessibility permission) — resumed in a terminal',
+  already:'already running, left untouched',
+  gone:'project folder no longer exists, skipped',
+  failed:'could not reopen automatically'
+};
 let saves=[], hi=-1, projects=[], cur=localStorage.getItem('qs.proj')||'__all__';
 async function loadProjects(){
   projects=await (await api('/api/projects')).json();
@@ -660,7 +776,7 @@ function renderTabs(){
     b.textContent=label;
     b.onclick=()=>{
       if(val==='__new__'){
-        const name=prompt('新项目叫什么?(比如 PHLLM、Heartlines)');
+        const name=prompt('Project name');
         if(!name||!name.trim()) return;
         api('/api/projects',{method:'POST',body:JSON.stringify({name:name.trim()})}).then(async r=>{
           projects=await r.json(); cur=name.trim();
@@ -672,16 +788,16 @@ function renderTabs(){
     };
     box.appendChild(b);
   };
-  mk('全部','__all__');
-  projects.forEach(p=>mk('📁 '+p,p));
-  mk('+ 新建项目','__new__','add');
+  mk('All','__all__');
+  projects.forEach(p=>mk(p,p));
+  mk('+ New project','__new__','add');
 }
 function rel(iso){
   const d=(Date.now()-new Date(iso))/60000;
-  if(d<1) return '刚刚';
-  if(d<60) return Math.floor(d)+' 分钟前';
-  if(d<1440) return Math.floor(d/60)+' 小时前';
-  return Math.floor(d/1440)+' 天前';
+  if(d<1) return 'just now';
+  if(d<60) return Math.floor(d)+'m ago';
+  if(d<1440) return Math.floor(d/60)+'h ago';
+  return Math.floor(d/1440)+'d ago';
 }
 function escH(s){const d=document.createElement('i');d.textContent=s;return d.innerHTML}
 async function refresh(){
@@ -689,29 +805,30 @@ async function refresh(){
   saves=cur==='__all__'?all:all.filter(s=>s.project===cur);
   const box=$('#slots'); box.textContent='';
   if(!saves.length){
-    box.innerHTML='<div class="empty"><b>'+(cur==='__all__'?'还没有存档。':'这个项目下还没有存档。')+'</b><br>点右上角新建,或在被打断前按你的热键。</div>';
+    box.innerHTML='<div class="empty"><b>No save points yet.</b><br>Create one before you step away.</div>';
     return;
   }
   saves.forEach((s,i)=>{
     const el=document.createElement('div');
     el.className='slot'+(i===hi?' hi':'');
     const chips=[];
-    if(s.project&&cur==='__all__') chips.push('<span class="chip">📁 <b>'+escH(s.project)+'</b></span>');
-    if(s.agents) chips.push('<span class="chip">🤖 <b>'+s.agents+'</b> 个 AI 会话</span>');
-    if(s.tabs) chips.push('<span class="chip">浏览器 <b>'+s.tabs+'</b> 标签</span>');
-    if(s.terms) chips.push('<span class="chip">终端 <b>'+s.terms+'</b> 目录</span>');
-    if(s.code) chips.push('<span class="chip">Code <b>'+s.code+'</b> 工作区</span>');
-    if(s.front) chips.push('<span class="chip">当时在 <b>'+escH(s.front)+'</b></span>');
+    if(s.project&&cur==='__all__') chips.push('<span class="chip"><b>'+escH(s.project)+'</b></span>');
+    if(s.agents) chips.push('<span class="chip"><b>'+s.agents+'</b> AI session'+(s.agents>1?'s':'')+'</span>');
+    if(s.tabs) chips.push('<span class="chip"><b>'+s.tabs+'</b> tabs</span>');
+    if(s.terms) chips.push('<span class="chip"><b>'+s.terms+'</b> terminals</span>');
+    if(s.code) chips.push('<span class="chip"><b>'+s.code+'</b> workspace'+(s.code>1?'s':'')+'</span>');
+    if(s.front) chips.push('<span class="chip">in <b>'+escH(s.front)+'</b></span>');
     el.innerHTML=
       '<div class="when"><span class="slotno">SLOT '+String(saves.length-i).padStart(2,'0')+'</span>'+
       '<span class="rel">'+rel(s.ts)+'</span><span>'+s.ts.replace('T',' ')+'</span></div>'+
-      '<div class="intent'+(s.intent?'':' none')+'">'+(s.intent?'「'+escH(s.intent)+'」':'当时没留话')+'</div>'+
+      '<div class="intent'+(s.intent?'':' none')+'">'+(s.intent?escH(s.intent):'Untitled')+'</div>'+
+      (s.note?'<p class="notep">'+escH(s.note)+'</p>':'')+
       '<div class="chips">'+chips.join('')+'</div>'+
-      '<div class="acts"><button class="load">⏪ 读档</button><button class="ghost">删除</button></div>';
+      '<div class="acts"><button class="load">Load</button><button class="ghost">Delete</button></div>';
     el.querySelector('.load').onclick=()=>doLoad(s,el);
     el.querySelector('.ghost').onclick=async e=>{
       e.stopPropagation();
-      if(!confirm('删除这个存档?')) return;
+      if(!confirm('Delete this save point?')) return;
       await api('/api/delete/'+s.slug,{method:'POST'});
       refresh();
     };
@@ -719,23 +836,25 @@ async function refresh(){
   });
 }
 async function doLoad(s,el){
-  const b=el.querySelector('.load'); b.disabled=true; b.textContent='恢复中…';
-  toast('正在把缺的补回来…');
+  const b=el.querySelector('.load'); b.disabled=true; b.textContent='Loading…';
+  toast('Restoring…');
   let r=null;
   try{ r=await (await api('/api/load/'+s.slug,{method:'POST'})).json(); }catch(e){}
-  b.disabled=false; b.textContent='⏪ 读档';
-  if(!r||!r.summary){ toast('恢复出了点问题,看看终端输出'); return; }
+  b.disabled=false; b.textContent='Load';
+  if(!r||!r.summary){ toast('Restore failed — check the terminal output'); return; }
   showResult(r.summary);
 }
 function showResult(sm){
   const v=document.createElement('div'); v.className='veil';
-  let items='<li>补开标签 <b>'+sm.tabs_opened+'</b> 个,已开着的 <b>'+sm.tabs_already+'</b> 个没动</li>'+
-    '<li>终端目录 <b>'+sm.terms_opened.length+'</b> 个'+(sm.terms_skipped?'(跳过 '+sm.terms_skipped+' 个已在用的)':'')+'</li>'+
-    '<li>VS Code 工作区 <b>'+sm.code+'</b> 个</li>';
-  (sm.agents||[]).forEach(a=>{items+='<li>🤖 '+escH(a.name)+':'+escH(a.text)+'</li>';});
-  v.innerHTML='<div class="modal"><h2>你当时说</h2>'+
-    '<div class="quote">「'+escH(sm.intent)+'」</div><ul>'+items+'</ul>'+
-    '<div class="mrow"><button class="load" id="ok">回去干活</button></div></div>';
+  let items='<li>Reopened <b>'+sm.tabs_opened+'</b> tabs — <b>'+sm.tabs_already+'</b> already open</li>'+
+    '<li><b>'+sm.terms_opened.length+'</b> terminal directories'+(sm.terms_skipped?' ('+sm.terms_skipped+' already in use)':'')+'</li>'+
+    '<li><b>'+sm.code+'</b> VS Code workspaces</li>';
+  (sm.agents||[]).forEach(a=>{items+='<li>'+escH(a.name)+' — '+(AGENT_TEXT[a.how]||a.how)+'</li>';});
+  v.innerHTML='<div class="modal"><h2>Restored</h2>'+
+    (sm.intent?'<div class="quote">'+escH(sm.intent)+'</div>':'')+
+    (sm.note?'<p class="notefull">'+escH(sm.note)+'</p>':'')+
+    '<ul>'+items+'</ul>'+
+    '<div class="mrow"><button class="load" id="ok">Done</button></div></div>';
   document.body.appendChild(v);
   v.querySelector('#ok').onclick=()=>v.remove();
   v.addEventListener('click',e=>{if(e.target===v)v.remove();});
@@ -748,16 +867,20 @@ function toast(m){
 $('#newBtn').onclick=()=>{
   const proj=cur==='__all__'?'':cur;
   const v=document.createElement('div'); v.className='veil';
-  v.innerHTML='<div class="modal"><h2>此刻你正要干嘛?</h2><p>一句话,给回来的你。'+(proj?'存进「'+escH(proj)+'」。':'存为未分类,想归类先在上面选个项目。')+'</p>'+
-    '<input id="mi" maxlength="80" placeholder="比如:正在改 IPCW 权重,怀疑第 3 列单位错了">'+
-    '<div class="mrow"><button class="ghost" id="mc">算了</button><button class="load" id="mo">📌 存档</button></div></div>';
+  v.innerHTML='<div class="modal"><h2>New save point</h2>'+
+    '<p>'+(proj?'Filed under '+escH(proj)+'.':'Unfiled — select a project tab first to file it.')+'</p>'+
+    '<input id="mi" maxlength="80" placeholder="Title">'+
+    '<textarea id="mn" maxlength="2000" placeholder="Notes (optional)"></textarea>'+
+    '<div class="mrow"><button class="ghost" id="mc">Cancel</button><button class="load" id="mo">Save</button></div></div>';
   document.body.appendChild(v);
   const inp=v.querySelector('#mi'); inp.focus();
   const go=async()=>{
-    const intent=inp.value.trim()||'(无)';
-    v.remove(); toast('正在冻结当前状态…');
-    await api('/api/save',{method:'POST',body:JSON.stringify({intent,project:proj})});
-    toast('✅ 已存档'); refresh();
+    const intent=inp.value.trim();
+    if(!intent){inp.focus();return;}
+    const note=v.querySelector('#mn').value.trim();
+    v.remove(); toast('Saving…');
+    await api('/api/save',{method:'POST',body:JSON.stringify({intent,note,project:proj})});
+    toast('Saved'); refresh();
   };
   v.querySelector('#mo').onclick=go;
   inp.addEventListener('keydown',e=>{if(e.key==='Enter')go(); if(e.key==='Escape')v.remove();});
@@ -775,7 +898,7 @@ setInterval(refresh,60000);
 </script></body></html>'''
 
 def run_ui(port=7799, open_browser=True):
-    import secrets, threading
+    import secrets
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     token = secrets.token_hex(16)
     page = UI_HTML.replace('__TOKEN__', token).encode()
@@ -812,6 +935,7 @@ def run_ui(port=7799, open_browser=True):
                 for slug, st in all_saves():
                     out.append({
                         'slug': slug, 'ts': st['ts'], 'intent': st.get('intent') or '',
+                        'note': st.get('note') or '',
                         'project': st.get('project') or '',
                         'tabs': sum(len(w) for w in st.get('chrome', [])) + sum(len(w) for w in st.get('safari', [])),
                         'terms': len(st['terminals']['cwds']) if st.get('terminals') else 0,
@@ -838,10 +962,10 @@ def run_ui(port=7799, open_browser=True):
                 self._json({'ok': False}, 404); return
             m = re.fullmatch(r'/api/delete/(\d{8}-\d{6})', self.path)
             if m:
-                import shutil
+                import shutil as _sh
                 d = os.path.join(VAULT, m.group(1))
                 if os.path.isdir(d):
-                    shutil.rmtree(d)
+                    _sh.rmtree(d)
                 self._json({'ok': True}); return
             n = int(self.headers.get('Content-Length') or 0)
             try:
@@ -849,7 +973,8 @@ def run_ui(port=7799, open_browser=True):
             except Exception:
                 body = {}
             if self.path == '/api/save':
-                do_save(body.get('intent') or '(无)', body.get('project') or '')
+                do_save(body.get('intent') or 'Untitled', body.get('project') or '',
+                        body.get('note') or '')
                 self._json({'ok': True}); return
             if self.path == '/api/projects':
                 self._json(add_project(body.get('name', ''))); return
@@ -866,9 +991,9 @@ def run_ui(port=7799, open_browser=True):
         except Exception:
             alive = False
         if alive:
-            print(f'🎮 面板已经在运行: http://127.0.0.1:{port}')
+            print(f'🎮 Panel already running: http://127.0.0.1:{port}')
             if open_browser:
-                subprocess.run(['open', f'http://127.0.0.1:{port}'])
+                webbrowser.open(f'http://127.0.0.1:{port}')
             return
     except Exception:
         pass
@@ -881,12 +1006,12 @@ def run_ui(port=7799, open_browser=True):
         except OSError:
             continue
     if srv is None:
-        print('端口 7799–7801 都被占用了,先退出旧的进程再试。')
+        print('Ports 7799-7801 are all in use; stop the old process first.')
         return
     url = f'http://127.0.0.1:{port}'
-    print(f'🎮 Quicksave 面板: {url}   (Ctrl+C 退出)')
+    print(f'🎮 Quicksave panel: {url}   (Ctrl+C to quit)')
     if open_browser:
-        subprocess.run(['open', url])
+        webbrowser.open(url)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -897,22 +1022,24 @@ def run_ui(port=7799, open_browser=True):
 def main():
     args = sys.argv[1:]
     if not args:
-        out = osa('choose from list {"📌 新建存档", "⏪ 读档"} with title "Quicksave" with prompt "工作存档点" OK button name "选它" cancel button name "关闭"', timeout=120)
-        if out == '📌 新建存档':
-            do_save()
-        elif out == '⏪ 读档':
-            do_load()
+        if IS_MAC:
+            out = osa('choose from list {"📌 新建存档", "⏪ 读档"} with title "Quicksave" OK button name "选它" cancel button name "关闭"', timeout=120)
+            if out == '📌 新建存档':
+                do_save()
+            elif out == '⏪ 读档':
+                do_load()
+        else:
+            print(__doc__)
         return
     cmd = args[0]
     if cmd == 'save':
-        intent = None
+        intent = args[args.index('-m') + 1] if '-m' in args else None
+        note = args[args.index('-n') + 1] if '-n' in args else ''
         project = ''
-        if '-m' in args:
-            intent = args[args.index('-m') + 1]
         if '-p' in args:
             project = args[args.index('-p') + 1]
             add_project(project)
-        do_save(intent, project)
+        do_save(intent, project, note)
     elif cmd == 'list':
         do_list()
     elif cmd == 'load':

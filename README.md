@@ -1,33 +1,75 @@
-# Quicksave — 工作存档点
+# Quicksave
 
-像游戏存档一样冻结与恢复工作状态:被打断前一键存档(留一句"我正要干嘛"),
-回来时一键读档,浏览器标签、终端目录、VS Code 工作区、Claude Code / Codex
-会话按差量补回来(已经开着的不动)。
+Game-style save points for your work. Freeze your working state before an
+interruption — browser tabs, terminal directories, VS Code workspaces, and
+running AI coding sessions (Claude Code / Codex) — together with a short note
+on what you were about to do. When you come back, load the save point and
+only what is missing gets reopened.
 
-数据全部存在本机 `~/Library/Application Support/Quicksave/`,不上传任何内容。
+Everything is stored locally as small JSON files. Nothing is uploaded.
 
-## 用法
+## Why
+
+Research by Gloria Mark (UC Irvine) found that interrupted work is resumed
+after roughly 23 minutes on average, usually via several intervening tasks.
+The expensive part of an interruption is not reopening windows — it is
+reconstructing what you were thinking. A save point stores both.
+
+## Install
+
+```sh
+git clone https://github.com/mia-mz/quicksave.git ~/Projects/quicksave
+echo "alias qs='python3 ~/Projects/quicksave/quicksave.py'" >> ~/.zshrc
+```
+
+Python 3.9+, standard library only.
+
+## Usage
 
 ```
-qs              # 弹面板选存档/读档
-qs save -m "正在改 IPCW 权重" -p PHLLM
-qs list
-qs load [编号]
-qs ui           # 图形面板 http://127.0.0.1:7799
+qs save -m "title" [-n "notes"] [-p project]   create a save point
+qs list                                        list save points
+qs load [index]                                restore one
+qs ui                                          web panel at 127.0.0.1:7799
 ```
 
-`qs` 为 `python3 ~/Projects/quicksave/quicksave.py` 的别名。
+On macOS, bind `qs` to a global hotkey with the Shortcuts app
+(Run Shell Script → `python3 ~/Projects/quicksave/quicksave.py`).
 
-## 恢复行为
+## What restore does
 
-- 差量恢复:只补"当时开着、现在关了"的标签页和终端目录
-- AI 会话按存档时的宿主恢复:当时在 VS Code 内置终端里跑的,就打开对应
-  工作区并在新内置终端里 `claude --resume <会话ID>`;在 Terminal 里跑的回
-  Terminal。往 VS Code 里自动输入需要给终端授"辅助功能"权限,且仅在确认
-  VS Code 位于前台时才会粘贴
-- 读档结束给一份实账:补开了多少、跳过了多少、每个会话接在了哪里
+- **Diff restore** — only tabs and terminal directories that are gone get
+  reopened; anything still open is left untouched.
+- **AI sessions** — `claude` sessions resume with their exact session id, in
+  the host they were captured in: a session that lived in the VS Code
+  integrated terminal reopens there (the workspace is opened first, and keys
+  are only sent once VS Code owns the keyboard); a Terminal session goes back
+  to a terminal window. `codex` reopens its session picker.
+- **VS Code** — workspaces reopen via the `code` CLI; VS Code's own hot exit
+  brings back editors and unsaved changes.
+- A report at the end states exactly what was reopened, skipped, or failed.
 
-## 权限(一次性)
+## Platform support
 
-- 自动化:允许终端控制 Chrome / Safari / Terminal / System Events
-- 辅助功能:允许终端模拟按键(仅用于往 VS Code 内置终端粘贴恢复命令)
+| Capability                | macOS | Linux | Windows |
+|---------------------------|:-----:|:-----:|:-------:|
+| Browser tabs (capture)    | ✅    | —     | —       |
+| Browser tabs (reopen)     | ✅    | ✅    | ✅      |
+| Terminal directories      | ✅    | ✅    | —       |
+| VS Code workspaces        | ✅    | ✅    | ✅      |
+| Claude Code / Codex resume| ✅    | ✅    | —       |
+| Web panel                 | ✅    | ✅    | ✅      |
+
+Linux and Windows support is best-effort; capture backends beyond macOS are
+welcome as contributions.
+
+## Permissions (macOS, one-time)
+
+- **Automation** — allow your terminal to control Chrome / Safari / Terminal
+  / System Events (prompted on first use).
+- **Accessibility** — required only for typing the resume command into the
+  VS Code integrated terminal; without it, sessions fall back to Terminal.
+
+## License
+
+MIT
