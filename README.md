@@ -1,6 +1,6 @@
 # Quicksave
 
-**Close everything. Get it all back in seconds.**
+**Close everything and get it all back in seconds.**
 
 Quicksave gives your work a save point. Press it before you step away and it freezes your tabs, terminals, VS Code workspaces, and running AI coding sessions. Load it later and your workspace rebuilds itself in seconds. Everything stays on your machine as small local files.
 
