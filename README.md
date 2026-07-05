@@ -1,16 +1,40 @@
 # Quicksave
 
-**Pick up exactly where you left off.**
+**Close everything. Get it all back in seconds.**
 
-You are deep in a problem. A meeting pops up, a message pulls you away, the laptop closes for the night. When you come back, the windows are gone and the thread of thought is gone with them. You spend the next twenty minutes rebuilding a mental state you had perfectly a moment ago.
+Quicksave gives your work a save point. Press it before you step away and it freezes your tabs, terminals, VS Code workspaces, and running AI coding sessions. Load it later and your workspace rebuilds itself in seconds. Everything stays on your machine as small local files.
 
-Quicksave gives your work a save point. Press it before you step away and it freezes everything that matters. Come back later, load the save point, and your workspace rebuilds itself in seconds.
+## The problem
 
-## The cost this removes
+You keep forty tabs open because closing them feels like losing them. Your workspaces pile up for the same reason. Your Mac warns you about memory and you force quit things you were still using. At the end of the day you leave it all running, since tomorrow you will not remember where you were. This is one problem wearing four faces. There has never been a safe way to put your work down and pick it back up.
 
-Research by Gloria Mark at UC Irvine found that interrupted work takes about 23 minutes to resume, usually after drifting through several unrelated tasks first. The expensive part of an interruption is the reconstruction of what you were doing. Quicksave stores that state so the reconstruction is free.
+## What Quicksave does for your day
 
-A knowledge worker loses hours every week to this. Quicksave hands those hours back.
+### Close without losing anything
+
+Forty tabs and a stack of workspaces stay open only because you are afraid of losing them. A save point captures the whole state, so you can close all of it and trust that one load brings it back.
+
+### Free your memory
+
+Save, then quit. Your working state becomes a few kilobytes on disk and your memory returns to the system right away. The next time you need the work, load the save point and the difference comes back. You trade expensive RAM for a file smaller than a photo.
+
+### Skip the manual rebuild
+
+Reopening tabs one by one, typing cd into every folder, reopening each workspace by hand is slow and dull work. Quicksave does the entire rebuild for you and leaves anything already open exactly as it is.
+
+### Walk away and come back tomorrow
+
+Save at the end of the day. Load it the next morning and your tabs, terminals, and workspaces return, including the unsaved edits that VS Code hot exit keeps for you.
+
+## Built to be trusted
+
+### Your work stays on your machine
+
+Everything is stored as small local files. No upload, no account, no server. Safe for sensitive material such as health data.
+
+### You see exactly what happened
+
+Every load ends with a plain report of what reopened, how many tabs were already open, how many directories were skipped, and where each AI session landed. You always know what Quicksave did on your behalf.
 
 ## What a save point captures
 
@@ -20,12 +44,6 @@ A knowledge worker loses hours every week to this. Quicksave hands those hours b
 - **Claude Code and Codex sessions**, resumed by their exact session id in the same place they were running
 - **Your intent**, one line plus optional notes on what you were about to do next
 
-Everything stays on your machine as small local files. Nothing is uploaded, no account is required, and your work never touches a server.
-
-## How it feels
-
-A meeting starts in two minutes. You press your hotkey, type "reworking the IPCW weights, third column unit looks wrong," and walk away. An hour later you load that save point. Your tabs return, your terminals land back in the right folders, VS Code reopens your project, and your Claude Code conversation continues where it stopped. The note reminds you of the exact thought you had. You are working again inside ten seconds.
-
 ## Smart restore
 
 Quicksave restores the difference, so it stays out of your way.
@@ -33,7 +51,6 @@ Quicksave restores the difference, so it stays out of your way.
 - Only tabs that are gone get reopened. Anything still open stays as it is.
 - Terminal directories already in use are left alone.
 - AI sessions return to the host they came from. A session that lived in the VS Code integrated terminal reopens there, and a Terminal session goes back to a terminal window.
-- Every load ends with a plain report of what reopened, what was already there, and what was skipped.
 
 ## Install
 
