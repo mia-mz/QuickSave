@@ -9,8 +9,14 @@ Usage:
 All data stays local in ~/Library/Application Support/Quicksave (macOS)
 or ~/.quicksave (Linux/Windows). Nothing is uploaded.
 
-Platform support: macOS full; Linux best-effort (no browser capture);
-Windows minimal (VS Code workspaces + AI sessions).
+Platform support:
+  macOS   full (Chrome/Safari/Firefox tabs, terminals, VS Code, AI sessions)
+  Linux   terminals, VS Code, AI sessions, Firefox tabs
+  Windows terminals, VS Code, AI sessions, Firefox tabs
+Chrome and Safari tab capture use AppleScript and are macOS only. On every
+platform Firefox tabs are read from its session file. Windows backends read
+process state through PowerShell and the Win32 API and want testing on a real
+Windows machine.
 """
 import json, os, re, subprocess, sys, datetime, time, shutil, webbrowser
 from urllib.parse import unquote
@@ -72,10 +78,101 @@ def add_project(name):
         json.dump({'projects': lst}, open(PROJECTS_FILE, 'w'), ensure_ascii=False)
     return lst
 
+_WIN_PROCS = None
+
+def _win_proc_list():
+    """Windows: [{pid, ppid, name, cmd}] via a single PowerShell CIM query.
+    Cached for the life of this invocation."""
+    global _WIN_PROCS
+    if _WIN_PROCS is not None:
+        return _WIN_PROCS
+    _WIN_PROCS = []
+    ps = ('Get-CimInstance Win32_Process | '
+          'Select-Object ProcessId,ParentProcessId,Name,CommandLine | '
+          'ConvertTo-Json -Compress')
+    try:
+        out = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+                             capture_output=True, text=True, timeout=25).stdout
+        data = json.loads(out) if out.strip() else []
+        if isinstance(data, dict):
+            data = [data]
+        for d in data:
+            _WIN_PROCS.append({
+                'pid': str(d.get('ProcessId') or ''),
+                'ppid': str(d.get('ParentProcessId') or ''),
+                'name': d.get('Name') or '',
+                'cmd': d.get('CommandLine') or '',
+            })
+    except Exception:
+        pass
+    return _WIN_PROCS
+
+def _win_cwd(pid):
+    """Windows: read a process's current directory out of its PEB.
+    64-bit Python on 64-bit Windows. Returns None on any failure."""
+    try:
+        import ctypes, struct
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        ntdll = ctypes.WinDLL('ntdll', use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+                                          ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+        k32.ReadProcessMemory.restype = wintypes.BOOL
+        PROCESS_QUERY_INFORMATION, PROCESS_VM_READ = 0x0400, 0x0010
+        h = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, int(pid))
+        if not h:
+            return None
+        try:
+            class PBI(ctypes.Structure):
+                _fields_ = [("Reserved1", ctypes.c_void_p),
+                            ("PebBaseAddress", ctypes.c_void_p),
+                            ("Reserved2", ctypes.c_void_p * 2),
+                            ("UniqueProcessId", ctypes.c_void_p),
+                            ("Reserved3", ctypes.c_void_p)]
+            pbi = PBI()
+            rl = ctypes.c_ulong()
+            if ntdll.NtQueryInformationProcess(h, 0, ctypes.byref(pbi),
+                                               ctypes.sizeof(pbi), ctypes.byref(rl)) != 0:
+                return None
+            if not pbi.PebBaseAddress:
+                return None
+
+            def rd(addr, size):
+                buf = (ctypes.c_char * size)()
+                n = ctypes.c_size_t()
+                if not k32.ReadProcessMemory(h, ctypes.c_void_p(addr), buf, size, ctypes.byref(n)):
+                    return None
+                return buf.raw[:n.value]
+
+            d = rd(pbi.PebBaseAddress + 0x20, 8)        # PEB->ProcessParameters
+            if not d:
+                return None
+            params = struct.unpack('<Q', d)[0]
+            if not params:
+                return None
+            us = rd(params + 0x38, 16)                  # CurrentDirectory.DosPath (UNICODE_STRING)
+            if not us:
+                return None
+            length = struct.unpack('<H', us[0:2])[0]
+            buf_ptr = struct.unpack('<Q', us[8:16])[0]
+            if not length or not buf_ptr:
+                return None
+            raw = rd(buf_ptr, length)
+            if not raw:
+                return None
+            path = raw.decode('utf-16-le', 'ignore').rstrip('\x00').rstrip('\\')
+            return path or None
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return None
+
 def _proc_table():
-    """pid -> (ppid, command path)."""
+    """pid -> (ppid, command name)."""
     if IS_WIN:
-        return {}
+        return {p['pid']: (p['ppid'], p['name']) for p in _win_proc_list() if p['pid']}
     try:
         out = subprocess.run(['ps', '-ax', '-o', 'pid=,ppid=,comm='],
                              capture_output=True, text=True, timeout=10).stdout
@@ -99,6 +196,8 @@ def _ancestors(pid, table, limit=20):
     return out
 
 def _cwd_of(pid):
+    if IS_WIN:
+        return _win_cwd(pid)
     if IS_LIN:
         try:
             return os.readlink(f'/proc/{pid}/cwd')
@@ -152,8 +251,15 @@ def _spawn_terminal(cwd, cmd=None):
         return False
     if IS_WIN:
         try:
-            inner = f'cd /d "{cwd}"' + (f' && {cmd}' if cmd else '')
-            subprocess.Popen(['cmd', '/c', 'start', 'cmd', '/K', inner])
+            wt = shutil.which('wt')
+            if wt:
+                args = [wt, '-d', cwd]
+                if cmd:
+                    args += ['cmd', '/k', cmd]
+                subprocess.Popen(args)
+            else:
+                inner = f'cd /d "{cwd}"' + (f' && {cmd}' if cmd else '')
+                subprocess.Popen(['cmd', '/c', 'start', 'cmd', '/k', inner])
             return True
         except Exception:
             return False
@@ -223,10 +329,92 @@ end tell'''
             i += 1
     return [w for w in wins if w]
 
+_AGENT_RE = re.compile(r'(?i)(?:^|[\\/"\s])(claude|codex)(?:\.exe|\.cmd|\.js|\.ps1)?(?:["\s]|$)')
+
+def _lz4_block_decompress(src):
+    """Minimal LZ4 block decoder (pure Python). Enough for Firefox sessions."""
+    out = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        token = src[i]; i += 1
+        lit = token >> 4
+        if lit == 15:
+            while i < n:
+                b = src[i]; i += 1; lit += b
+                if b != 255:
+                    break
+        out += src[i:i + lit]; i += lit
+        if i >= n:
+            break
+        offset = src[i] | (src[i + 1] << 8); i += 2
+        if offset == 0:
+            break
+        mlen = (token & 0x0F)
+        if mlen == 15:
+            while i < n:
+                b = src[i]; i += 1; mlen += b
+                if b != 255:
+                    break
+        mlen += 4
+        start = len(out) - offset
+        for k in range(mlen):
+            out.append(out[start + k])
+    return bytes(out)
+
+def _read_mozlz4(path):
+    data = open(path, 'rb').read()
+    if data[:8] != b'mozLz40\x00':
+        return None
+    return _lz4_block_decompress(data[12:])
+
+def _firefox_profile_glob():
+    import glob
+    if IS_MAC:
+        root = os.path.expanduser('~/Library/Application Support/Firefox/Profiles')
+    elif IS_WIN:
+        root = os.path.join(os.environ.get('APPDATA', ''), 'Mozilla', 'Firefox', 'Profiles')
+    else:
+        root = os.path.expanduser('~/.mozilla/firefox')
+    files = []
+    for name in ('sessionstore-backups/recovery.jsonlz4', 'sessionstore.jsonlz4'):
+        files += glob.glob(os.path.join(root, '*', name))
+    return files
+
+def capture_firefox():
+    """Cross-platform Firefox open tabs, from the session recovery file."""
+    files = _firefox_profile_glob()
+    if not files:
+        return []
+    newest = max(files, key=lambda f: os.path.getmtime(f))
+    try:
+        raw = _read_mozlz4(newest)
+        data = json.loads(raw)
+    except Exception:
+        return []
+    wins = []
+    for w in data.get('windows', []):
+        tabs = []
+        for t in w.get('tabs', []):
+            ents = t.get('entries', [])
+            idx = t.get('index', len(ents))
+            if 1 <= idx <= len(ents):
+                e = ents[idx - 1]
+                url = e.get('url', '')
+                if url.startswith(('http', 'file')):
+                    tabs.append({'url': url, 'title': e.get('title', '')})
+        if tabs:
+            wins.append(tabs)
+    return wins
+
 def _agent_pids(table):
-    """pids of running claude/codex CLI processes (with a tty)."""
+    """pids of running claude/codex CLI processes."""
     if IS_WIN:
-        return {}
+        found = {}
+        for p in _win_proc_list():
+            m = _AGENT_RE.search(p['cmd'])
+            if m and p['pid']:
+                found[p['pid']] = m.group(1).lower()
+        return found
     try:
         out = subprocess.run(['ps', '-ax', '-o', 'pid=,tty=,command='],
                              capture_output=True, text=True, timeout=10).stdout
@@ -247,11 +435,29 @@ def _agent_pids(table):
                 break
     return found
 
+_WIN_SHELLS = ('cmd.exe', 'powershell.exe', 'pwsh.exe', 'bash.exe', 'nu.exe')
+
 def _shell_cwds():
     """cwds of interactive shells, excluding scratch dirs and shells that are
     descendants of an AI agent."""
     if IS_WIN:
-        return []
+        table = _proc_table()
+        agents = set(_agent_pids(table))
+        cwds, seen = [], set()
+        for p in _win_proc_list():
+            if p['name'].lower() not in _WIN_SHELLS:
+                continue
+            if any(pp in agents for pp, _ in _ancestors(p['pid'], table)):
+                continue
+            c = _win_cwd(p['pid'])
+            if not c:
+                continue
+            c = os.path.normpath(c)
+            low = c.lower()
+            if low in seen or low.endswith('\\system32') or '\\temp' in low or '\\windows' in low:
+                continue
+            seen.add(low); cwds.append(c)
+        return cwds
     table = _proc_table()
     agents = set(_agent_pids(table))
     try:
@@ -321,16 +527,23 @@ def capture_vscode():
     except Exception:
         return []
 
+_TERM_NAMES = ('Terminal', 'iTerm2', 'iTerm', 'WarpTerminal', 'ghostty', 'kitty',
+               'alacritty', 'Hyper', 'gnome-terminal-server', 'konsole', 'xterm',
+               'WindowsTerminal.exe', 'OpenConsole.exe', 'conhost.exe')
+
 def _host_of(pid, table):
+    """Scan the whole ancestor chain and prefer VS Code when present, so a
+    terminal-host ancestor never masks a VS Code integrated terminal."""
+    is_vscode = is_term = False
     for _pid, comm in _ancestors(pid, table):
         name = comm.rsplit('/', 1)[-1]
-        if 'Code Helper' in comm or name in ('Electron', 'Code', 'code'):
-            return 'vscode'
-        if name in ('Terminal', 'iTerm2', 'iTerm', 'WarpTerminal', 'ghostty',
-                    'kitty', 'alacritty', 'Hyper', 'gnome-terminal-server',
-                    'konsole', 'xterm'):
-            return 'terminal'
-    return 'terminal'
+        if 'Code Helper' in comm or name in ('Electron', 'Code', 'code', 'Code.exe'):
+            is_vscode = True
+        elif name in _TERM_NAMES:
+            is_term = True
+    if is_vscode:
+        return 'vscode'
+    return 'terminal' if is_term else 'terminal'
 
 def capture_agents():
     """Running Claude Code / Codex sessions: tool, cwd, host app, resume id.
@@ -357,7 +570,11 @@ def capture_agents():
 
 def _claude_session_for(cwd):
     base = os.path.expanduser('~/.claude/projects/')
-    for enc in (cwd.replace('/', '-'), re.sub(r'[/.]', '-', cwd)):
+    encs = (cwd.replace('/', '-'),
+            re.sub(r'[/.]', '-', cwd),
+            cwd.replace('\\', '-').replace('/', '-').replace(':', '-'),
+            re.sub(r'[\\/.:]', '-', cwd))
+    for enc in encs:
         d = base + enc
         try:
             files = [f for f in os.listdir(d) if f.endswith('.jsonl')]
@@ -398,20 +615,22 @@ def do_save(intent=None, project='', note=''):
         'front': capture_front(),
         'chrome': capture_browser('Google Chrome'),
         'safari': capture_browser('Safari'),
+        'firefox': capture_firefox(),
         'terminals': capture_terminals(),
         'vscode': capture_vscode(),
         'agents': capture_agents(),
     }
     json.dump(state, open(os.path.join(d, 'state.json'), 'w'),
               ensure_ascii=False, indent=1)
-    ntabs = sum(len(w) for w in state['chrome']) + sum(len(w) for w in state['safari'])
+    ntabs = (sum(len(w) for w in state['chrome']) + sum(len(w) for w in state['safari'])
+             + sum(len(w) for w in state['firefox']))
     nterm = len(state['terminals']['cwds']) if state['terminals'] else 0
     nag = len(state['agents'])
     print(f'✅ 存档完成 {slug}' + (f'  [{project}]' if project else ''))
     print(f'   {intent}')
     print(f'   浏览器 {ntabs} 标签 · 终端 {nterm} 目录 · VS Code {len(state["vscode"])} 工作区 · AI 会话 {nag}')
-    if not IS_MAC:
-        print('   (本平台不支持浏览器标签采集)')
+    if not IS_MAC and ntabs == 0:
+        print('   (提示: 本平台的浏览器采集目前支持 Firefox)')
     notify('Quicksave', intent[:40])
     return slug
 
@@ -454,6 +673,26 @@ def restore_browser(app, wins):
             for u in urls:
                 webbrowser.open(u)
         opened += len(urls)
+    return opened, skipped
+
+def restore_firefox(wins):
+    """Reopen missing Firefox tabs through the default handler. (opened, skipped)."""
+    if not wins:
+        return 0, 0
+    current = set()
+    for w in capture_firefox():
+        for t in w:
+            current.add(t.get('url'))
+    opened = skipped = 0
+    for w in wins:
+        for t in w:
+            u = t.get('url', '')
+            if not u.startswith(('http', 'file')):
+                continue
+            if u in current:
+                skipped += 1
+            else:
+                webbrowser.open(u); opened += 1
     return opened, skipped
 
 def restore_terminals(term, exclude=None):
@@ -604,9 +843,14 @@ def all_saves():
                 pass
     return out
 
+def _count_tabs(st):
+    return (sum(len(w) for w in st.get('chrome', []))
+            + sum(len(w) for w in st.get('safari', []))
+            + sum(len(w) for w in st.get('firefox', [])))
+
 def label(slug, st):
     t = datetime.datetime.fromisoformat(st['ts']).strftime('%m-%d %H:%M')
-    ntabs = sum(len(w) for w in st.get('chrome', [])) + sum(len(w) for w in st.get('safari', []))
+    ntabs = _count_tabs(st)
     nterm = len(st['terminals']['cwds']) if st.get('terminals') else 0
     nag = len(st.get('agents') or [])
     intent = (st.get('intent') or '(无)')[:24]
@@ -660,11 +904,12 @@ def do_load(idx=None, interactive=True):
     used, agent_detail = restore_agents(st.get('agents', []))
     c_open, c_skip = restore_browser('Google Chrome', st.get('chrome', []))
     s_open, s_skip = restore_browser('Safari', st.get('safari', []))
+    f_open, f_skip = restore_firefox(st.get('firefox', []))
     t_open, t_skip = restore_terminals(st.get('terminals'), exclude=used)
     summary = {
         'intent': st.get('intent') or '',
         'note': st.get('note') or '',
-        'tabs_opened': c_open + s_open, 'tabs_already': c_skip + s_skip,
+        'tabs_opened': c_open + s_open + f_open, 'tabs_already': c_skip + s_skip + f_skip,
         'terms_opened': t_open, 'terms_skipped': t_skip,
         'code': ncode,
         'agents': [{'name': n, 'how': h} for n, h in agent_detail],
@@ -983,7 +1228,7 @@ def run_ui(port=7799, open_browser=True):
                         'slug': slug, 'ts': st['ts'], 'intent': st.get('intent') or '',
                         'note': st.get('note') or '',
                         'project': st.get('project') or '',
-                        'tabs': sum(len(w) for w in st.get('chrome', [])) + sum(len(w) for w in st.get('safari', [])),
+                        'tabs': _count_tabs(st),
                         'terms': len(st['terminals']['cwds']) if st.get('terminals') else 0,
                         'code': len(st.get('vscode', [])),
                         'agents': len(st.get('agents') or []),

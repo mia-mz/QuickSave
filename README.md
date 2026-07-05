@@ -71,16 +71,16 @@ On macOS, `qs` can be bound to a global hotkey with the Shortcuts app. Add a "Ru
 
 ## Platform support
 
-| Capability                 | macOS | Linux    | Windows  |
-|----------------------------|:-----:|:--------:|:--------:|
-| Browser tabs (capture)     | Yes   | Planned  | Planned  |
-| Browser tabs (reopen)      | Yes   | Yes      | Yes      |
-| Terminal directories       | Yes   | Yes      | Planned  |
-| VS Code workspaces         | Yes   | Yes      | Yes      |
-| Claude Code / Codex resume | Yes   | Yes      | Planned  |
-| Web panel                  | Yes   | Yes      | Yes      |
+| Capability                 | macOS | Linux | Windows |
+|----------------------------|:-----:|:-----:|:-------:|
+| Firefox tabs               | Yes   | Yes   | Yes     |
+| Chrome and Safari tabs     | Yes   | No    | No      |
+| Terminal directories       | Yes   | Yes   | Yes     |
+| VS Code workspaces         | Yes   | Yes   | Yes     |
+| Claude Code / Codex resume | Yes   | Yes   | Yes     |
+| Web panel                  | Yes   | Yes   | Yes     |
 
-macOS has full support today. Linux and Windows cover the core and are open for contributions on the remaining backends.
+Firefox tabs are read from its session file on every platform. Chrome and Safari tab capture rely on AppleScript and stay macOS only. Terminal directories on Windows come from the Win32 process API, and AI sessions resume in a terminal window. On macOS an AI session that lived in the VS Code integrated terminal resumes there. The Windows backends read process state through PowerShell and the Win32 API and are ready for validation on a real Windows machine.
 
 ## Permissions on macOS
 
