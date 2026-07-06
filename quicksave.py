@@ -1483,6 +1483,11 @@ def run_ui(port=7799, open_browser=True):
 # ---------------- main ----------------
 
 def main():
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
     args = sys.argv[1:]
     if not args:
         if IS_MAC:
